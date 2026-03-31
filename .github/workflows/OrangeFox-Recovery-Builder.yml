@@ -121,9 +121,6 @@ jobs:
         set +e
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        export FOX_VERSION="R12.1"                   
-        export OF_MAINTAINER="hackpupg001-a11y"      
-        export LC_ALL="C"                             
         set -e
         ${{ steps.fox_branch.outputs.value }}
 
