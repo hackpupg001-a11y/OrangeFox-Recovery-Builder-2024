@@ -122,6 +122,7 @@ jobs:
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
         export FOX_VIRTUAL_AB_DEVICE=1
+        export TARGET_RELEASE=ap2a
         set -e
         ${{ steps.fox_branch.outputs.value }}
 
