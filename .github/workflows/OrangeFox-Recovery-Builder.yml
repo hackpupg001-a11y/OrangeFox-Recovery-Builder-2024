@@ -121,7 +121,6 @@ jobs:
         set +e
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        export FOX_VIRTUAL_AB_DEVICE=1
         set -e
         ${{ steps.fox_branch.outputs.value }}
 
