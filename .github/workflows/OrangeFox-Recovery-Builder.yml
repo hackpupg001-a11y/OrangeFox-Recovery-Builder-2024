@@ -48,13 +48,21 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet --upgrade gdown
           rm -rf _dl && mkdir -p _dl
+          # Lấy ID file từ link: .../file/d/<ID>/view  hoặc  ...open?id=<ID>  (không dùng --fuzzy vì gdown bản mới đã bỏ)
+          FILE_ID=""
+          if [[ "$DRIVE_URL" =~ /d/([A-Za-z0-9_-]+) ]]; then FILE_ID="${BASH_REMATCH[1]}"; fi
+          if [ -z "$FILE_ID" ] && [[ "$DRIVE_URL" =~ [?\&]id=([A-Za-z0-9_-]+) ]]; then FILE_ID="${BASH_REMATCH[1]}"; fi
           ok=0
           for attempt in 1 2 3; do
             echo "== Lần tải $attempt =="
             if [[ "$DRIVE_URL" == *"/folders/"* ]]; then
-              gdown --folder --remaining-ok "$DRIVE_URL" -O _dl && ok=1 && break
+              gdown --folder "$DRIVE_URL" -O _dl && ok=1 && break
+            elif [ -n "$FILE_ID" ]; then
+              echo "File ID: $FILE_ID"
+              gdown "https://drive.google.com/uc?id=${FILE_ID}" -O _dl/source.zip && ok=1 && break
             else
-              gdown --fuzzy "$DRIVE_URL" -O _dl/source.zip && ok=1 && break
+              echo "::error::Không đọc được ID file từ link. Dán link dạng https://drive.google.com/file/d/<ID>/view"
+              exit 1
             fi
             sleep 10
           done
