@@ -1,5 +1,11 @@
 name: Build EAS Fault Insight (Rust) từ link Google Drive
 
+# Bản 1 exe: giao diện, luật mặc định, khoá app, tài khoản SQL, cert TLS được nhúng vào exe (build.rs),
+# mã hoá AES-256-GCM, khoá chia mảnh. JS phía trình duyệt (trong index106.html) được obfuscate
+# trước khi nhúng, để không ai đọc thẳng logic JS bằng F12 -> View source.
+# Secrets tuỳ chọn (Settings -> Secrets and variables -> Actions), nếu không có thì build.rs lấy từ file trong source:
+#   EAS_APP_KEY (hex)  EAS_DB_USER  EAS_DB_PASS  EAS_TLS_CERT (PEM)  EAS_TLS_KEY (PEM)
+
 # Cách dùng: GitHub repo -> tab Actions -> "Build EAS Fault Insight (Rust) từ link Google Drive"
 #            -> Run workflow -> dán link Google Drive vào ô drive_url -> Run.
 # Lưu file này vào repo tại: .github/workflows/build-rust-from-drive.yml
@@ -20,6 +26,11 @@ on:
           - windows
           - linux
           - both
+      obfuscate_js:
+        description: "Obfuscate JS trong index HTML trước khi nhúng vào exe"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -35,7 +46,7 @@ jobs:
         os: ${{ fromJSON(inputs.target == 'both' && '["windows-latest","ubuntu-latest"]' || (inputs.target == 'linux' && '["ubuntu-latest"]' || '["windows-latest"]')) }}
 
     steps:
-      - name: Cài Python (để tải từ Google Drive)
+      - name: Cài Python (để tải từ Google Drive và xử lý HTML)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -100,6 +111,126 @@ jobs:
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
           ls -la "$DIR"
 
+      - name: Cài Node.js (để obfuscate JS)
+        if: ${{ inputs.obfuscate_js }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Obfuscate JS trong index HTML trước khi nhúng
+        if: ${{ inputs.obfuscate_js }}
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          npm install --no-save javascript-obfuscator@4
+
+          cat > _obfuscate_inline_js.py <<'PYEOF'
+          import re, subprocess, pathlib, sys
+
+          # Giống đúng thứ tự ưu tiên "first_file" trong build.rs: chỉ file ĐẦU TIÊN
+          # tồn tại trong nhóm index HTML mới được build.rs nhúng vào exe, nên ở đây
+          # cũng chỉ obfuscate đúng 1 file đó (không obfuscate các bản trùng không dùng tới).
+          html_group = [
+              "index106.html", "index100.html", "index.html",
+              "templates/index.html", "templates/index100.html",
+          ]
+          targets = []
+          for name in html_group:
+              if pathlib.Path(name).is_file():
+                  targets.append(name)
+                  break
+          if pathlib.Path("index_script.js").is_file():
+              targets.append("index_script.js")
+
+          if not targets:
+              print("Khong tim thay index HTML / index_script.js de obfuscate, bo qua buoc nay.")
+              sys.exit(0)
+
+          OBF_BIN = str((pathlib.Path("node_modules") / ".bin" / "javascript-obfuscator").resolve())
+
+          OBF_ARGS = [
+              "--compact", "true",
+              "--control-flow-flattening", "true",
+              "--control-flow-flattening-threshold", "0.75",
+              "--dead-code-injection", "true",
+              "--dead-code-injection-threshold", "0.3",
+              "--string-array", "true",
+              "--string-array-encoding", "rc4",
+              "--string-array-threshold", "0.8",
+              "--split-strings", "true",
+              "--split-strings-chunk-length", "8",
+              "--transform-object-keys", "true",
+              "--numbers-to-expressions", "true",
+              "--simplify", "true",
+              "--identifier-names-generator", "hexadecimal",
+              # Giữ false: nhiều hàm JS được HTML gọi qua onclick="ten_ham(...)".
+              # Đổi tên biến/hàm toàn cục sẽ làm những nút bấm đó hỏng.
+              "--rename-globals", "false",
+              # Tắt self-defending / debug-protection: hai cái này hay làm treo tab
+              # khi người vận hành mở F12 để debug lỗi giao diện thật, không đáng đánh đổi
+              # cho một công cụ nội bộ. Vẫn giữ control-flow-flattening + string-array
+              # để không ai đọc thẳng logic bằng View source.
+              "--self-defending", "false",
+              "--debug-protection", "false",
+          ]
+
+          def obfuscate_file(path: pathlib.Path):
+              tmp_out = path.with_suffix(path.suffix + ".obf.js")
+              cmd = [OBF_BIN, str(path), "--output", str(tmp_out)] + OBF_ARGS
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0 or not tmp_out.is_file():
+                  print(f"::warning::Obfuscate '{path}' that bai, giu nguyen file goc.")
+                  print(r.stderr[-2000:])
+                  return None
+              code = tmp_out.read_text(encoding="utf-8")
+              tmp_out.unlink(missing_ok=True)
+              return code
+
+          SCRIPT_RE = re.compile(r'(<script(?![^>]*\bsrc=)[^>]*>)(.*?)(</script>)', re.DOTALL | re.IGNORECASE)
+
+          total_blocks = 0
+          for name in targets:
+              p = pathlib.Path(name)
+              if name.endswith(".js"):
+                  code = p.read_text(encoding="utf-8")
+                  if not code.strip():
+                      continue
+                  tmp_in = p.with_suffix(".src.js")
+                  tmp_in.write_text(code, encoding="utf-8")
+                  obf = obfuscate_file(tmp_in)
+                  tmp_in.unlink(missing_ok=True)
+                  if obf is not None:
+                      p.write_text(obf, encoding="utf-8")
+                      print(f"Da obfuscate {name}")
+                  continue
+
+              html = p.read_text(encoding="utf-8")
+
+              def repl(m):
+                  nonlocal total_blocks
+                  open_tag, code, close_tag = m.group(1), m.group(2), m.group(3)
+                  if not code.strip():
+                      return m.group(0)
+                  tmp_in = pathlib.Path(f"_obf_block_{total_blocks}.js")
+                  tmp_in.write_text(code, encoding="utf-8")
+                  obf = obfuscate_file(tmp_in)
+                  tmp_in.unlink(missing_ok=True)
+                  if obf is None:
+                      return m.group(0)
+                  total_blocks += 1
+                  return open_tag + "\n" + obf + "\n" + close_tag
+
+              new_html = SCRIPT_RE.sub(repl, html)
+              p.write_text(new_html, encoding="utf-8")
+              print(f"Da obfuscate cac khoi <script> trong {name}")
+
+          print(f"Tong so khoi JS da obfuscate: {total_blocks}")
+          PYEOF
+
+          python3 _obfuscate_inline_js.py
+          rm -f _obfuscate_inline_js.py
+
       - name: Cài Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
@@ -123,9 +254,15 @@ jobs:
         with:
           workspaces: "${{ steps.locate.outputs.dir }} -> target"
 
-      - name: Build release
+      - name: Build release (nhúng dữ liệu vào exe)
         shell: bash
         working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          EAS_BUILD_APP_KEY: ${{ secrets.EAS_APP_KEY }}
+          EAS_BUILD_DB_USER: ${{ secrets.EAS_DB_USER }}
+          EAS_BUILD_DB_PASS: ${{ secrets.EAS_DB_PASS }}
+          EAS_BUILD_TLS_CERT: ${{ secrets.EAS_TLS_CERT }}
+          EAS_BUILD_TLS_KEY: ${{ secrets.EAS_TLS_KEY }}
         run: |
           rustc --version
           cargo --version
@@ -144,16 +281,10 @@ jobs:
           OUT="$GITHUB_WORKSPACE/dist/$PKG"
           rm -rf "$GITHUB_WORKSPACE/dist" && mkdir -p "$OUT"
           cp "target/release/${NAME}${EXT}" "$OUT/"
-          # file chạy cần đi kèm (index106.html được đọc lúc chạy, không nhúng vào exe)
           # giữ Cargo.lock đã build thành công: commit file này vào source để các lần build sau ra đúng phiên bản thư viện
           if [ -f Cargo.lock ]; then cp Cargo.lock "$OUT/Cargo.lock.buildok"; fi
-          for item in index106.html templates data uploads README.md; do
-            if [ -e "$item" ]; then cp -r "$item" "$OUT/"; fi
-          done
-          # không đóng gói khoá / dữ liệu nhạy cảm nếu lỡ nằm trong source
-          rm -f "$OUT/data/.secret_key" "$OUT/data/app_key.txt" "$OUT/data/users_local.json"
-          rm -rf "$OUT/data/.eas_cache"
-          mkdir -p "$OUT/data" "$OUT/uploads/specialid"
+          # Giao diện / luật / khoá / cert đã nằm trong exe -> chỉ đóng gói exe + script chạy.
+          # data/ và uploads/ sẽ tự tạo lúc chạy (cache, .secret_key, users_local.json, specialid).
 
           if [ "$RUNNER_OS" = "Windows" ]; then
             cat > "$OUT/start_windows.bat" <<EOF
@@ -164,8 +295,7 @@ jobs:
           if "%EAS_DB_USER%"=="" set EAS_DB_USER=root
           if "%EAS_DB_NAME%"=="" set EAS_DB_NAME=ami_cell
           if "%EAS_PORT%"=="" set EAS_PORT=50125
-          rem Điền mật khẩu SQL của bạn vào dòng dưới (hoặc đặt biến môi trường EAS_DB_PASSWORD):
-          if "%EAS_DB_PASSWORD%"=="" set EAS_DB_PASSWORD=
+          rem Tài khoản/mật khẩu SQL đã nhúng trong exe; đặt EAS_DB_USER / EAS_DB_PASSWORD ở đây nếu muốn ghi đè.
           ${NAME}.exe
           pause
           EOF
@@ -178,7 +308,7 @@ jobs:
           export EAS_DB_USER="\${EAS_DB_USER:-root}"
           export EAS_DB_NAME="\${EAS_DB_NAME:-ami_cell}"
           export EAS_PORT="\${EAS_PORT:-50125}"
-          # export EAS_DB_PASSWORD="điền mật khẩu SQL"
+          # tài khoản/mật khẩu SQL đã nhúng trong exe; export EAS_DB_USER / EAS_DB_PASSWORD nếu muốn ghi đè
           ./${NAME}
           EOF
             chmod +x "$OUT/start_linux.sh" "$OUT/${NAME}"
