@@ -103,6 +103,17 @@ jobs:
       - name: Cài Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ghim zip 2.5.0 (calamine 0.26 lỗi biên dịch với zip >= 2.6)
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+          if grep -q 'name = "calamine"' Cargo.lock; then
+            cargo update -p zip --precise 2.5.0 || echo "Bỏ qua: không ghim được zip (có thể Cargo.toml đã tự ghim)"
+          fi
+          grep -A1 'name = "zip"' Cargo.lock || true
+
       - name: Cài NASM (Windows, cần cho một số thư viện TLS)
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
@@ -134,6 +145,8 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/dist" && mkdir -p "$OUT"
           cp "target/release/${NAME}${EXT}" "$OUT/"
           # file chạy cần đi kèm (index106.html được đọc lúc chạy, không nhúng vào exe)
+          # giữ Cargo.lock đã build thành công: commit file này vào source để các lần build sau ra đúng phiên bản thư viện
+          if [ -f Cargo.lock ]; then cp Cargo.lock "$OUT/Cargo.lock.buildok"; fi
           for item in index106.html templates data uploads README.md; do
             if [ -e "$item" ]; then cp -r "$item" "$OUT/"; fi
           done
