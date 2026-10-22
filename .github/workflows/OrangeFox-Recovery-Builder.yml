@@ -189,7 +189,9 @@ jobs:
 
           SCRIPT_RE = re.compile(r'(<script(?![^>]*\bsrc=)[^>]*>)(.*?)(</script>)', re.DOTALL | re.IGNORECASE)
 
-          total_blocks = 0
+          total_blocks = [0]  # dung list thay vi int de khoi can 'nonlocal'
+                              # ('nonlocal' chi hoat dong trong ham long nhau,
+                              # nhung vong lap nay dang o muc module -> SyntaxError)
           for name in targets:
               p = pathlib.Path(name)
               if name.endswith(".js"):
@@ -208,24 +210,23 @@ jobs:
               html = p.read_text(encoding="utf-8")
 
               def repl(m):
-                  nonlocal total_blocks
                   open_tag, code, close_tag = m.group(1), m.group(2), m.group(3)
                   if not code.strip():
                       return m.group(0)
-                  tmp_in = pathlib.Path(f"_obf_block_{total_blocks}.js")
+                  tmp_in = pathlib.Path(f"_obf_block_{total_blocks[0]}.js")
                   tmp_in.write_text(code, encoding="utf-8")
                   obf = obfuscate_file(tmp_in)
                   tmp_in.unlink(missing_ok=True)
                   if obf is None:
                       return m.group(0)
-                  total_blocks += 1
+                  total_blocks[0] += 1
                   return open_tag + "\n" + obf + "\n" + close_tag
 
               new_html = SCRIPT_RE.sub(repl, html)
               p.write_text(new_html, encoding="utf-8")
               print(f"Da obfuscate cac khoi <script> trong {name}")
 
-          print(f"Tong so khoi JS da obfuscate: {total_blocks}")
+          print(f"Tong so khoi JS da obfuscate: {total_blocks[0]}")
           PYEOF
 
           python3 _obfuscate_inline_js.py
