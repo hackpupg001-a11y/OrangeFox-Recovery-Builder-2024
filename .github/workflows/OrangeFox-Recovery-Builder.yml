@@ -126,7 +126,7 @@ jobs:
           npm install --no-save javascript-obfuscator@4
 
           cat > _obfuscate_inline_js.py <<'PYEOF'
-          import re, subprocess, pathlib, sys
+          import re, subprocess, pathlib, sys, platform
 
           # Giống đúng thứ tự ưu tiên "first_file" trong build.rs: chỉ file ĐẦU TIÊN
           # tồn tại trong nhóm index HTML mới được build.rs nhúng vào exe, nên ở đây
@@ -147,7 +147,14 @@ jobs:
               print("Khong tim thay index HTML / index_script.js de obfuscate, bo qua buoc nay.")
               sys.exit(0)
 
-          OBF_BIN = str((pathlib.Path("node_modules") / ".bin" / "javascript-obfuscator").resolve())
+          # Tren Windows, file trong node_modules/.bin khong co duoi la script
+          # shell (shebang #!/usr/bin/env node) -> Windows khong chay truc tiep
+          # duoc (loi WinError 193 "%1 is not a valid Win32 application").
+          # npm cung tao ban ".cmd" canh no danh rieng cho Windows, phai goi
+          # qua cmd.exe thi moi chay duoc.
+          IS_WINDOWS = platform.system() == "Windows"
+          BIN_DIR = pathlib.Path("node_modules") / ".bin"
+          OBF_BIN = str((BIN_DIR / ("javascript-obfuscator.cmd" if IS_WINDOWS else "javascript-obfuscator")).resolve())
 
           OBF_ARGS = [
               "--compact", "true",
@@ -177,7 +184,12 @@ jobs:
 
           def obfuscate_file(path: pathlib.Path):
               tmp_out = path.with_suffix(path.suffix + ".obf.js")
-              cmd = [OBF_BIN, str(path), "--output", str(tmp_out)] + OBF_ARGS
+              args = [str(path), "--output", str(tmp_out)] + OBF_ARGS
+              if IS_WINDOWS:
+                  # .cmd khong phai exe that, phai cho cmd.exe chay ho (/c)
+                  cmd = ["cmd", "/c", OBF_BIN] + args
+              else:
+                  cmd = [OBF_BIN] + args
               r = subprocess.run(cmd, capture_output=True, text=True)
               if r.returncode != 0 or not tmp_out.is_file():
                   print(f"::warning::Obfuscate '{path}' that bai, giu nguyen file goc.")
