@@ -1,232 +1,178 @@
-name: OrangeFox - Build
+name: Build EAS Fault Insight (Rust) từ link Google Drive
+
+# Cách dùng: GitHub repo -> tab Actions -> "Build EAS Fault Insight (Rust) từ link Google Drive"
+#            -> Run workflow -> dán link Google Drive vào ô drive_url -> Run.
+# Lưu file này vào repo tại: .github/workflows/build-rust-from-drive.yml
 
 on:
   workflow_dispatch:
     inputs:
-      MANIFEST_BRANCH:
-        description: 'OrangeFox Branch'
+      drive_url:
+        description: "Link Google Drive tới file .zip (hoặc thư mục) chứa source. Chia sẻ: 'Bất kỳ ai có đường liên kết'"
         required: true
-        default: '12.1'
+        type: string
+      target:
+        description: "Build cho hệ điều hành nào"
+        required: true
         type: choice
+        default: windows
         options:
-        - 14.1
-        - 12.1
-        - 11.0
-      DEVICE_TREE:
-        description: 'Custom Recovery Tree'
-        required: true
-        default: 'https://github.com/hackpupg001-a11y/android_device_xiaomi_myron'
-      DEVICE_TREE_BRANCH:
-        description: 'Custom Recovery Tree Branch'
-        required: true
-        default: 'ofox-12.1'
-      DEVICE_PATH:
-        description: 'Specify your device path.'
-        required: true
-        default: 'device/xiaomi/myron'
-      DEVICE_NAME:
-        description: 'Specify your Device Codename.'
-        required: true
-        default: 'myron'
-      BUILD_TARGET:
-        description: 'Specify your Build Target'
-        required: true
-        default: 'recovery'
-        type: choice
-        options:
-        - boot
-        - recovery
-        - vendorboot
-      LDCHECK:
-        description: 'Path of blobs to check' 
-        required: true
-        default: 'system/bin/qseecomd'
-      RECOVERY_TAR:
-        description: 'Release recovery.tar For Samsung devices'
-        required: false
-        default: false
-        type: boolean
-      RECOVERY_INSTALLER:
-        description: 'Include recovery installer zip'
-        type: boolean
-        required: true
-        default: true
+          - windows
+          - linux
+          - both
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build OFRP by ${{ github.actor }}
-    runs-on: ubuntu-latest
-    if: github.event.repository.owner.id == github.event.sender.id
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    permissions:
-      contents: write
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.target == 'both' && '["windows-latest","ubuntu-latest"]' || (inputs.target == 'linux' && '["ubuntu-latest"]' || '["windows-latest"]')) }}
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Cài Python (để tải từ Google Drive)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    - name: Display Inputs
-      run: |
-        echo "::group::User Environment Variables"
-        echo "Displaying variables/inputs."
-        echo "Include Recovery Installer: ${{ github.event.inputs.RECOVERY_INSTALLER }}"
-        echo "Release recovery.tar For Samsung devices: ${{ github.event.inputs.RECOVERY_TAR }}"
-        echo "::endgroup::"
+      - name: Tải source từ Google Drive
+        shell: bash
+        env:
+          DRIVE_URL: ${{ inputs.drive_url }}   # truyền qua biến môi trường, không chèn thẳng vào script
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade gdown
+          rm -rf _dl && mkdir -p _dl
+          ok=0
+          for attempt in 1 2 3; do
+            echo "== Lần tải $attempt =="
+            if [[ "$DRIVE_URL" == *"/folders/"* ]]; then
+              gdown --folder --remaining-ok "$DRIVE_URL" -O _dl && ok=1 && break
+            else
+              gdown --fuzzy "$DRIVE_URL" -O _dl/source.zip && ok=1 && break
+            fi
+            sleep 10
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Không tải được từ Google Drive. Kiểm tra: (1) link đã chia sẻ 'Bất kỳ ai có đường liên kết' chưa, (2) nếu báo 'Too many users' thì thử lại sau ít phút, (3) dán đúng link file .zip hoặc thư mục."
+            exit 1
+          fi
+          ls -la _dl
 
-    - name: Clean-up
-      uses: rokibhasansagar/slimhub_actions@main
+      - name: Giải nén và tìm Cargo.toml
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf _src && mkdir -p _src
+          shopt -s nullglob
+          zips=(_dl/*.zip)
+          if (( ${#zips[@]} )); then
+            for z in "${zips[@]}"; do
+              python -m zipfile -t "$z" >/dev/null
+              python -m zipfile -e "$z" _src
+            done
+          else
+            cp -r _dl/. _src/
+          fi
+          # lấy Cargo.toml nằm nông nhất (gói zip thường có 1 thư mục bọc ngoài)
+          CARGO=$(find _src -name Cargo.toml -not -path '*/target/*' | awk '{ print length($0) " " $0 }' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$CARGO" ]; then
+            echo "::error::Không thấy Cargo.toml trong source đã giải nén. Nội dung:"
+            find _src -maxdepth 3 | head -60
+            exit 1
+          fi
+          DIR=$(dirname "$CARGO")
+          echo "Thư mục project: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          ls -la "$DIR"
 
-    - name: Swap Space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 24
-      
-    - name: Build Environment
-      run: |
-        sudo apt update
-        sudo apt -y upgrade
-        git clone https://gitlab.com/OrangeFox/misc/scripts
-        cd scripts
-        sudo bash setup/android_build_env.sh
-      
-    - name: Set-up Manifest
-      if: github.event.inputs.MANIFEST_BRANCH == '11.0' || github.event.inputs.MANIFEST_BRANCH == '12.1' || github.event.inputs.MANIFEST_BRANCH == '14.1'
-      run: |
-        mkdir -p ${GITHUB_WORKSPACE}/OrangeFox
-        cd ${GITHUB_WORKSPACE}/OrangeFox
-        git config --global user.name "Samuel Kendall"
-        git config --global user.email "kinguser981@gmail.com"
-        git clone https://gitlab.com/OrangeFox/sync.git
-        cd sync
-        ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+      - name: Cài Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Clone Device Tree
-      run: |
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        git clone ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
-        cd ${{ github.event.inputs.DEVICE_PATH }}
-        echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
+      - name: Cài NASM (Windows, cần cho một số thư viện TLS)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
 
-    - name: Check Manifest Branch
-      uses: haya14busa/action-cond@v1
-      id: fox_branch
-      with:
-        cond: ${{ github.event.inputs.MANIFEST_BRANCH == '11.0' || github.event.inputs.MANIFEST_BRANCH == '12.1' }}
-        if_true: lunch twrp_${{ github.event.inputs.DEVICE_NAME }}-eng && make clean && mka adbd ${{ github.event.inputs.BUILD_TARGET }}image
-        if_false: lunch omni_${{ github.event.inputs.DEVICE_NAME }}-ap2a-eng && make clean && mka ${{ github.event.inputs.BUILD_TARGET }}image
-      
-    - name: Building OrangeFox
-      run: |
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        set +e
-        source build/envsetup.sh
-        export ALLOW_MISSING_DEPENDENCIES=true
-        export FOX_VIRTUAL_AB_DEVICE=1
-        export TARGET_RELEASE=ap2a
-        set -e
-        ${{ steps.fox_branch.outputs.value }}
+      - name: Cache thư viện Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ steps.locate.outputs.dir }} -> target"
 
-    - name: Set Build Date # Output will be use in Release
-      run: |
-        echo "BUILD_DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-        DEVICE_TREE_URL="${{ github.event.inputs.DEVICE_TREE }}"
-        if [[ "${DEVICE_TREE_URL}" == *.git ]]; then
-          DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
-        fi
-        echo "DEVICE_TREE_URL=${DEVICE_TREE_URL}" >> $GITHUB_ENV
+      - name: Build release
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          rustc --version
+          cargo --version
+          cargo build --release
 
-    - name: Check if Recovery Exist
-      run: |
-        cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        if [ -f out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img ]; then
-            echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
-            echo "FILE_PATH=${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "MD5_IMG=$(md5sum out/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img | cut -d ' ' -f 1)" >> $GITHUB_ENV
-        elif [ -f out/target/product/${{ github.event.inputs.DEVICE_NAME }}/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img ]; then
-            echo "CHECK_IMG_IS_OK=true" >> $GITHUB_ENV
-            echo "FILE_PATH=${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/target/product/${{ github.event.inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-            echo "MD5_IMG=$(md5sum out/target/product/${{ github.event.inputs.DEVICE_NAME }}/target/product/${{ github.event.inputs.DEVICE_NAME }}/OrangeFox*.img | cut -d ' ' -f 1)" >> $GITHUB_ENV
-        else
-            echo "Recovery out directory is empty."
-            cd Exit
-        fi
+      - name: Đóng gói
+        id: pack
+        shell: bash
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -euo pipefail
+          NAME=$(cargo metadata --no-deps --format-version 1 | python -c "import sys,json; d=json.load(sys.stdin); print([t['name'] for p in d['packages'] for t in p['targets'] if 'bin' in t['kind']][0])")
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          PKG="eas-fault-insight-${RUNNER_OS}"
+          OUT="$GITHUB_WORKSPACE/dist/$PKG"
+          rm -rf "$GITHUB_WORKSPACE/dist" && mkdir -p "$OUT"
+          cp "target/release/${NAME}${EXT}" "$OUT/"
+          # file chạy cần đi kèm (index106.html được đọc lúc chạy, không nhúng vào exe)
+          for item in index106.html templates data uploads README.md; do
+            if [ -e "$item" ]; then cp -r "$item" "$OUT/"; fi
+          done
+          # không đóng gói khoá / dữ liệu nhạy cảm nếu lỡ nằm trong source
+          rm -f "$OUT/data/.secret_key" "$OUT/data/app_key.txt" "$OUT/data/users_local.json"
+          rm -rf "$OUT/data/.eas_cache"
+          mkdir -p "$OUT/data" "$OUT/uploads/specialid"
 
-    - name: Rename the Recovery
-      run: |
-        cd ${{ env.FILE_PATH }}/
-        if [ "${{ github.event.inputs.BUILD_TARGET }}" = "boot" ]; then
-        mv OrangeFox*.img boot.img
-        echo "RECOVERY_TYPE=boot" >> $GITHUB_ENV
-        echo "boot.img file found!"
-        elif [ "${{ github.event.inputs.BUILD_TARGET }}" = "recovery" ]; then
-        mv OrangeFox*.img recovery.img
-        echo "RECOVERY_TYPE=recovery" >> $GITHUB_ENV
-        echo "recovery.img file found!"
-        elif [ "${{ github.event.inputs.BUILD_TARGET }}" = "vendorboot" ]; then
-        mv OrangeFox*.img vendor_boot.img
-        echo "RECOVERY_TYPE=vendor_boot" >> $GITHUB_ENV
-        echo "vendor_boot.img file found!"
-        else
-        echo "No Recovery file found!"
-        fi
-      continue-on-error: true
-      
-    - name: Include Recovery Installer
-      run: |
-        if [ ${{ github.event.inputs.RECOVERY_INSTALLER }} = true ]; then
-          cd ${{ env.FILE_PATH }}/
-          wget https://github.com/kinguser981/recovery-installer/releases/download/11256427880/recovery-installer.zip
-          zip -ur recovery-installer.zip ${{ env.RECOVERY_TYPE }}.img
-        fi
-      continue-on-error: true
-        
-    - name: Recovery to tar for Samsung devices
-      run: |
-        if [ ${{ github.event.inputs.RECOVERY_TAR }} = true ]; then
-          cd ${{ env.FILE_PATH }}/
-          tar -cvf ${{ env.RECOVERY_TYPE }}.tar ${{ env.RECOVERY_TYPE }}.img
-        fi
-      continue-on-error: true
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cat > "$OUT/start_windows.bat" <<EOF
+          @echo off
+          chcp 65001 >nul
+          if "%EAS_DB_HOST%"=="" set EAS_DB_HOST=127.0.0.1
+          if "%EAS_DB_PORT%"=="" set EAS_DB_PORT=3306
+          if "%EAS_DB_USER%"=="" set EAS_DB_USER=root
+          if "%EAS_DB_NAME%"=="" set EAS_DB_NAME=ami_cell
+          if "%EAS_PORT%"=="" set EAS_PORT=50125
+          rem Điền mật khẩu SQL của bạn vào dòng dưới (hoặc đặt biến môi trường EAS_DB_PASSWORD):
+          if "%EAS_DB_PASSWORD%"=="" set EAS_DB_PASSWORD=
+          ${NAME}.exe
+          pause
+          EOF
+          else
+            cat > "$OUT/start_linux.sh" <<EOF
+          #!/usr/bin/env bash
+          cd "\$(dirname "\$0")"
+          export EAS_DB_HOST="\${EAS_DB_HOST:-127.0.0.1}"
+          export EAS_DB_PORT="\${EAS_DB_PORT:-3306}"
+          export EAS_DB_USER="\${EAS_DB_USER:-root}"
+          export EAS_DB_NAME="\${EAS_DB_NAME:-ami_cell}"
+          export EAS_PORT="\${EAS_PORT:-50125}"
+          # export EAS_DB_PASSWORD="điền mật khẩu SQL"
+          ./${NAME}
+          EOF
+            chmod +x "$OUT/start_linux.sh" "$OUT/${NAME}"
+          fi
 
-    - name: Upload to Release
-      if: env.CHECK_IMG_IS_OK == 'true'
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          ${{ env.FILE_PATH }}/${{ env.RECOVERY_TYPE }}.img
-          ${{ env.FILE_PATH }}/${{ env.RECOVERY_TYPE }}.tar
-          ${{ env.FILE_PATH }}/recovery-installer.zip
-          ${{ env.FILE_PATH }}/OrangeFox*.zip
-        name: Unofficial OrangeFox for ${{ github.event.inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
-        tag_name: ${{ github.run_id }}
-        body: |
-          Build: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: [Device Tree/Branch](${{ github.event.inputs.DEVICE_TREE }}/tree/${{ github.event.inputs.DEVICE_TREE_BRANCH }})
-          Commit: Most recent [commit](${{ github.event.inputs.DEVICE_TREE }}/commit/${{ env.COMMIT_ID }}) during building.
-          
-    - name: Release ramdisk-recovery
-      if: env.CHECK_IMG_IS_OK == 'true'
-      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
-      with:
-        files: |
-          ${{ env.FILE_PATH }}/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.*
-          ${{ env.FILE_PATH }}/ramdisk-recovery.*
-        name: Unofficial OrangeFox for ${{ github.event.inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
-        tag_name: ${{ github.run_id }}
-        body: |
-          Target: ${{ env.RECOVERY_TYPE }}.img
-          Build: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: [Device Tree/Branch](${{ env.DEVICE_TREE_URL }}/tree/${{ inputs.DEVICE_TREE_BRANCH }})
-          Commit: Most recent [commit](${{ env.DEVICE_TREE_URL }}/commit/${{ env.COMMIT_ID }}) during building.
-          MD5 (img): ${{ env.MD5_IMG }}
-          
-    - name: Run LDCheck
-      run: |
-        cd tools
-        mv -n libneeds ${{ env.FILE_PATH }}/recovery/root/
-        mv -n ldcheck ${{ env.FILE_PATH }}/recovery/root/
-        cd ${{ env.FILE_PATH }}/recovery/root/
-        python3 ldcheck -p system/lib64:vendor/lib64:system/lib:vendor/lib -d ${{ github.event.inputs.LDCHECK }}
-        echo "Done checking missing dependencies. Review, and reconfigure your tree."
-      continue-on-error: true
-      
+          echo "name=$PKG" >> "$GITHUB_OUTPUT"
+          echo "### Build xong: $PKG" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Binary: \`${NAME}${EXT}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tải ở mục **Artifacts** cuối trang run này (giữ 30 ngày)." >> "$GITHUB_STEP_SUMMARY"
+          ls -la "$OUT"
+
+      - name: Tải file đã build lên (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: dist/${{ steps.pack.outputs.name }}
+          retention-days: 30
+          if-no-files-found: error
