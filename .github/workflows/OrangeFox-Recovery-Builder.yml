@@ -1,14 +1,11 @@
 name: Build EAS Fault Insight (Rust) từ link Google Drive
 
-# Bản 1 exe: giao diện, luật mặc định, khoá app, tài khoản SQL, cert TLS được nhúng vào exe (build.rs),
-# mã hoá AES-256-GCM, khoá chia mảnh. JS phía trình duyệt (trong index106.html) được obfuscate
-# trước khi nhúng, để không ai đọc thẳng logic JS bằng F12 -> View source.
+# Bản 1 exe: giao diện, luật mặc định, cấu hình chạy (build_config.txt), khoá app, tài khoản SQL, cert TLS
+# được nhúng vào exe (build.rs), mã hoá AES-256-GCM, khoá chia mảnh.
+# JS phía trình duyệt (trong index106.html) được obfuscate trước khi nhúng.
 # Secrets tuỳ chọn (Settings -> Secrets and variables -> Actions), nếu không có thì build.rs lấy từ file trong source:
+#   EAS_BUILD_CONFIG (nội dung KEY=VALUE nhiều dòng)
 #   EAS_APP_KEY (hex)  EAS_DB_USER  EAS_DB_PASS  EAS_TLS_CERT (PEM)  EAS_TLS_KEY (PEM)
-
-# Cách dùng: GitHub repo -> tab Actions -> "Build EAS Fault Insight (Rust) từ link Google Drive"
-#            -> Run workflow -> dán link Google Drive vào ô drive_url -> Run.
-# Lưu file này vào repo tại: .github/workflows/build-rust-from-drive.yml
 
 on:
   workflow_dispatch:
@@ -54,12 +51,11 @@ jobs:
       - name: Tải source từ Google Drive
         shell: bash
         env:
-          DRIVE_URL: ${{ inputs.drive_url }}   # truyền qua biến môi trường, không chèn thẳng vào script
+          DRIVE_URL: ${{ inputs.drive_url }}
         run: |
           set -euo pipefail
           python -m pip install --quiet --upgrade gdown
           rm -rf _dl && mkdir -p _dl
-          # Lấy ID file từ link: .../file/d/<ID>/view  hoặc  ...open?id=<ID>  (không dùng --fuzzy vì gdown bản mới đã bỏ)
           FILE_ID=""
           if [[ "$DRIVE_URL" =~ /d/([A-Za-z0-9_-]+) ]]; then FILE_ID="${BASH_REMATCH[1]}"; fi
           if [ -z "$FILE_ID" ] && [[ "$DRIVE_URL" =~ [?\&]id=([A-Za-z0-9_-]+) ]]; then FILE_ID="${BASH_REMATCH[1]}"; fi
@@ -99,7 +95,6 @@ jobs:
           else
             cp -r _dl/. _src/
           fi
-          # lấy Cargo.toml nằm nông nhất (gói zip thường có 1 thư mục bọc ngoài)
           CARGO=$(find _src -name Cargo.toml -not -path '*/target/*' | awk '{ print length($0) " " $0 }' | sort -n | head -1 | cut -d' ' -f2-)
           if [ -z "$CARGO" ]; then
             echo "::error::Không thấy Cargo.toml trong source đã giải nén. Nội dung:"
@@ -128,9 +123,6 @@ jobs:
           cat > _obfuscate_inline_js.py <<'PYEOF'
           import re, subprocess, pathlib, sys, platform
 
-          # Giống đúng thứ tự ưu tiên "first_file" trong build.rs: chỉ file ĐẦU TIÊN
-          # tồn tại trong nhóm index HTML mới được build.rs nhúng vào exe, nên ở đây
-          # cũng chỉ obfuscate đúng 1 file đó (không obfuscate các bản trùng không dùng tới).
           html_group = [
               "index106.html", "index100.html", "index.html",
               "templates/index.html", "templates/index100.html",
@@ -147,11 +139,6 @@ jobs:
               print("Khong tim thay index HTML / index_script.js de obfuscate, bo qua buoc nay.")
               sys.exit(0)
 
-          # Tren Windows, file trong node_modules/.bin khong co duoi la script
-          # shell (shebang #!/usr/bin/env node) -> Windows khong chay truc tiep
-          # duoc (loi WinError 193 "%1 is not a valid Win32 application").
-          # npm cung tao ban ".cmd" canh no danh rieng cho Windows, phai goi
-          # qua cmd.exe thi moi chay duoc.
           IS_WINDOWS = platform.system() == "Windows"
           BIN_DIR = pathlib.Path("node_modules") / ".bin"
           OBF_BIN = str((BIN_DIR / ("javascript-obfuscator.cmd" if IS_WINDOWS else "javascript-obfuscator")).resolve())
@@ -171,13 +158,7 @@ jobs:
               "--numbers-to-expressions", "true",
               "--simplify", "true",
               "--identifier-names-generator", "hexadecimal",
-              # Giữ false: nhiều hàm JS được HTML gọi qua onclick="ten_ham(...)".
-              # Đổi tên biến/hàm toàn cục sẽ làm những nút bấm đó hỏng.
               "--rename-globals", "false",
-              # Tắt self-defending / debug-protection: hai cái này hay làm treo tab
-              # khi người vận hành mở F12 để debug lỗi giao diện thật, không đáng đánh đổi
-              # cho một công cụ nội bộ. Vẫn giữ control-flow-flattening + string-array
-              # để không ai đọc thẳng logic bằng View source.
               "--self-defending", "false",
               "--debug-protection", "false",
           ]
@@ -186,7 +167,6 @@ jobs:
               tmp_out = path.with_suffix(path.suffix + ".obf.js")
               args = [str(path), "--output", str(tmp_out)] + OBF_ARGS
               if IS_WINDOWS:
-                  # .cmd khong phai exe that, phai cho cmd.exe chay ho (/c)
                   cmd = ["cmd", "/c", OBF_BIN] + args
               else:
                   cmd = [OBF_BIN] + args
@@ -201,9 +181,7 @@ jobs:
 
           SCRIPT_RE = re.compile(r'(<script(?![^>]*\bsrc=)[^>]*>)(.*?)(</script>)', re.DOTALL | re.IGNORECASE)
 
-          total_blocks = [0]  # dung list thay vi int de khoi can 'nonlocal'
-                              # ('nonlocal' chi hoat dong trong ham long nhau,
-                              # nhung vong lap nay dang o muc module -> SyntaxError)
+          total_blocks = [0]
           for name in targets:
               p = pathlib.Path(name)
               if name.endswith(".js"):
@@ -267,10 +245,11 @@ jobs:
         with:
           workspaces: "${{ steps.locate.outputs.dir }} -> target"
 
-      - name: Build release (nhúng dữ liệu vào exe)
+      - name: Build release (nhúng dữ liệu và build_config.txt vào exe)
         shell: bash
         working-directory: ${{ steps.locate.outputs.dir }}
         env:
+          EAS_BUILD_CONFIG: ${{ secrets.EAS_BUILD_CONFIG }}
           EAS_BUILD_APP_KEY: ${{ secrets.EAS_APP_KEY }}
           EAS_BUILD_DB_USER: ${{ secrets.EAS_DB_USER }}
           EAS_BUILD_DB_PASS: ${{ secrets.EAS_DB_PASS }}
@@ -294,21 +273,23 @@ jobs:
           OUT="$GITHUB_WORKSPACE/dist/$PKG"
           rm -rf "$GITHUB_WORKSPACE/dist" && mkdir -p "$OUT"
           cp "target/release/${NAME}${EXT}" "$OUT/"
-          # giữ Cargo.lock đã build thành công: commit file này vào source để các lần build sau ra đúng phiên bản thư viện
           if [ -f Cargo.lock ]; then cp Cargo.lock "$OUT/Cargo.lock.buildok"; fi
-          # Giao diện / luật / khoá / cert đã nằm trong exe -> chỉ đóng gói exe + script chạy.
-          # data/ và uploads/ sẽ tự tạo lúc chạy (cache, .secret_key, users_local.json, specialid).
+          # LƯU Ý QUAN TRỌNG: Cấu hình SQL / Port / Host trong build_config.txt đã được nhúng thẳng vào trong exe.
+          # Tuyệt đối KHÔNG set EAS_DB_HOST=127.0.0.1 trong start_windows.bat / start_linux.sh để tránh đè cấu hình nhúng!
 
           if [ "$RUNNER_OS" = "Windows" ]; then
             cat > "$OUT/start_windows.bat" <<EOF
           @echo off
           chcp 65001 >nul
-          if "%EAS_DB_HOST%"=="" set EAS_DB_HOST=127.0.0.1
-          if "%EAS_DB_PORT%"=="" set EAS_DB_PORT=3306
-          if "%EAS_DB_USER%"=="" set EAS_DB_USER=root
-          if "%EAS_DB_NAME%"=="" set EAS_DB_NAME=ami_cell
-          if "%EAS_PORT%"=="" set EAS_PORT=50125
-          rem Tài khoản/mật khẩu SQL đã nhúng trong exe; đặt EAS_DB_USER / EAS_DB_PASSWORD ở đây nếu muốn ghi đè.
+          cd /d "%~dp0"
+          rem Cau hinh SQL/Port/Host da duoc nhung san trong ${NAME}.exe tu build_config.txt.
+          rem Neu muon ghi de tam thoi, bo dau rem va sua gia tri ben duoi ( hoac dat file build_config.txt canh file .exe ):
+          rem set EAS_DB_HOST=10.119.209.198
+          rem set EAS_DB_PORT=9800
+          rem set EAS_DB_USER=ami
+          rem set EAS_DB_PASSWORD=admin123
+          rem set EAS_DB_NAME=ami_cell
+          rem set EAS_PORT=50125
           ${NAME}.exe
           pause
           EOF
@@ -316,12 +297,14 @@ jobs:
             cat > "$OUT/start_linux.sh" <<EOF
           #!/usr/bin/env bash
           cd "\$(dirname "\$0")"
-          export EAS_DB_HOST="\${EAS_DB_HOST:-127.0.0.1}"
-          export EAS_DB_PORT="\${EAS_DB_PORT:-3306}"
-          export EAS_DB_USER="\${EAS_DB_USER:-root}"
-          export EAS_DB_NAME="\${EAS_DB_NAME:-ami_cell}"
-          export EAS_PORT="\${EAS_PORT:-50125}"
-          # tài khoản/mật khẩu SQL đã nhúng trong exe; export EAS_DB_USER / EAS_DB_PASSWORD nếu muốn ghi đè
+          # Cau hinh SQL/Port/Host da duoc nhung san trong ./${NAME} tu build_config.txt.
+          # Neu muon ghi de tam thoi, bo dau # ben duoi ( hoac dat file build_config.txt canh binary ):
+          # export EAS_DB_HOST="10.119.209.198"
+          # export EAS_DB_PORT="9800"
+          # export EAS_DB_USER="ami"
+          # export EAS_DB_PASSWORD="admin123"
+          # export EAS_DB_NAME="ami_cell"
+          # export EAS_PORT="50125"
           ./${NAME}
           EOF
             chmod +x "$OUT/start_linux.sh" "$OUT/${NAME}"
